@@ -1,21 +1,21 @@
-// Login.jsx
 import { useState } from "react";
-import { useAuth } from "../context/AuthContext.jsx"; // Using AuthContext for login
-import { useNavigate } from "react-router-dom";
+import { useAuth } from "../context/AuthContext.jsx";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 
 function Login() {
     const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const { login } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [error, setError] = useState("");
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
       await login(email, password);
-      navigate("/dashboard");
-    } catch (error) {
+      navigate(location.state?.from ?? "/dashboard", { replace: true });
+    } catch {
       setError("Invalid login credentials. Please try again.");
     }
   };
@@ -65,7 +65,7 @@ function Login() {
 
         <p className="text-center text-gray-600">
           Don’t have an account?{' '}
-          <a href="/signup" className="font-medium text-purple-600 hover:underline">Sign Up</a>
+          <Link to="/signup" className="font-medium text-purple-600 hover:underline">Sign Up</Link>
         </p>
       </div>
     </div>

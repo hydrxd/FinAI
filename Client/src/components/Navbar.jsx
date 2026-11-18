@@ -1,13 +1,14 @@
-import React from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
 const Navbar = () => {
-  const { user, logout } = useAuth(); // Access user and logout from AuthContext
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
 
   const handleLogout = async () => {
     try {
       await logout();
+      navigate('/');
     } catch (error) {
       console.error("Logout failed:", error);
     }
@@ -42,9 +43,9 @@ const Navbar = () => {
             </li>
           ) : (
           <li>
-              <Link><button onClick={handleLogout} className="bg-red-500 p-0.5 rounded-lg text-gray-100 hover:text-white text-xl">
+              <button onClick={handleLogout} className="bg-red-500 p-0.5 rounded-lg text-gray-100 hover:text-white text-xl">
                 Logout
-              </button></Link>
+              </button>
             </li>)}
         </ul>
       </div>

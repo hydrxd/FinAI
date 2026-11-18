@@ -1,21 +1,27 @@
-import React, { useState } from 'react';
-import { useAuth } from '../context/AuthContext'; // Ensure this path is correct
-import { useNavigate } from 'react-router-dom';
+import { useState } from 'react';
+import { useAuth } from '../context/AuthContext';
+import { Link, useNavigate } from 'react-router-dom';
+
+const SIGNUP_ERRORS = {
+  'auth/email-already-in-use': 'An account with this email already exists.',
+  'auth/invalid-email': 'That email address is not valid.',
+  'auth/weak-password': 'Password must be at least 6 characters.',
+};
 
 const Signup = () => {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const { signup } = useAuth();
+  const { signUp } = useAuth();
   const navigate = useNavigate();
   const [error, setError] = useState("");
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      await signup(email, password);
+      await signUp(email, password);
       navigate("/dashboard");
     } catch (error) {
-      setError("Signup failed. Please try again.");
+      setError(SIGNUP_ERRORS[error.code] ?? "Signup failed. Please try again.");
     }
   };
 
@@ -64,7 +70,7 @@ const Signup = () => {
 
         <p className="text-center text-gray-600">
           Already have an account?{' '}
-          <a href="/login" className="font-medium text-green-600 hover:underline">Log In</a>
+          <Link to="/login" className="font-medium text-green-600 hover:underline">Log In</Link>
         </p>
       </div>
     </div>

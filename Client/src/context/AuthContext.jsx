@@ -1,6 +1,5 @@
-// AuthContext.jsx
 import { createContext, useContext, useEffect, useState } from "react";
-import { auth } from "../../firebase"; // Importing auth from firebase.js
+import { auth } from "../firebase";
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut } from "firebase/auth";
 
 const AuthContext = createContext();
@@ -11,10 +10,13 @@ export function useAuth() {
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
+  // True until Firebase has restored (or ruled out) a saved session.
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setUser(user);
+      setLoading(false);
     });
     return unsubscribe;
   }, []);
@@ -32,7 +34,7 @@ export function AuthProvider({ children }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, signUp, login, logout }}>
+    <AuthContext.Provider value={{ user, loading, signUp, login, logout }}>
       {children}
     </AuthContext.Provider>
   );

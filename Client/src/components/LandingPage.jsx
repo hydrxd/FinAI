@@ -1,4 +1,3 @@
-import React from 'react';
 import { Link } from 'react-router-dom';
 import { FaChartLine, FaWallet } from 'react-icons/fa'; // Importing icons
 

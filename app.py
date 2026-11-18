@@ -1,268 +1,411 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import logging
+import os
+import time
+from datetime import date, datetime, timedelta, timezone
+from typing import Literal
+
+import finnhub
+import firebase_admin
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import numpy as np
-import yfinance as yf
-from sklearn.preprocessing import MinMaxScaler
 import uvicorn
-import os
-import google.generativeai as genai
-import json
-import requests
-from datetime import datetime
-import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
-from transformers import BertTokenizer, BertForSequenceClassification
+import yfinance as yf
 from dotenv import load_dotenv
-from datetime import datetime,timedelta
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from firebase_admin import auth as firebase_auth
+from firebase_admin import credentials, firestore
+from google import genai
+from google.genai import types
+from google.cloud.firestore_v1.base_query import FieldFilter
+from pydantic import BaseModel, Field
+from sklearn.preprocessing import MinMaxScaler
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# Load the environment variables from .env file
 load_dotenv()
-# Use the application default credentials.
-cred = credentials.Certificate('finai.json')
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("finai")
 
-firebase_admin.initialize_app(cred)
+firebase_admin.initialize_app(credentials.Certificate(os.environ.get("FIREBASE_CREDENTIALS", "finai.json")))
 db = firestore.client()
 
-genai.configure(api_key=os.environ.get("GEMINI_KEY"))
+gemini = genai.Client(api_key=os.environ.get("GEMINI_KEY"))
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-# Load the sentiment analysis model
-sentiment_model_name = 'nlptown/bert-base-multilingual-uncased-sentiment'
-sentiment_tokenizer = BertTokenizer.from_pretrained(sentiment_model_name)
-sentiment_model = BertForSequenceClassification.from_pretrained(sentiment_model_name)
-import finnhub
 finnhub_client = finnhub.Client(api_key=os.environ.get("MARKET_KEY"))
 
-# Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(title="FinAI")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
-    allow_credentials=True,
+    allow_origins=os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class ChatRequest(BaseModel):
-    message: str
 
-generation_config = {
-  "temperature": 0.95,
-  "top_p": 0.95,
-  "top_k": 64,
-  "max_output_tokens": 8192,
-  "response_mime_type": "text/plain",
-}
+# ---------------------------------------------------------------- auth
 
-model = genai.GenerativeModel(
-  model_name="gemini-1.5-flash",
-  generation_config=generation_config,
-  system_instruction="You are an AI assistant that processes financial statements. Given a user input text, you need to extract the following information for each transaction mentioned:\n\n    1. Intent: The action or purpose of the user's statement (e.g., \"AddExpense\", \"ViewExpenses\", \"CheckBalance\").\n    2. Amount: The amount of money mentioned in the transaction (e.g., \"$50\", \"200\").\n    3. Category: The category of the expense (e.g., \"Groceries\", \"Electronics\", \"Rent\").\n    4. Note: The original user input text.\n    5. Timestamp: The current date and time in ISO 8601 format.\n\n    For each transaction in the input text, respond with a JSON object. If multiple transactions are mentioned, return a list of JSON objects. Here is an example JSON structure:\n\n    Example Inputs and Expected Outputs:\n\n    1. Input: \"I spent $50 on groceries and $20 on coffee.\"\n       - Output: [\n           {{\n               \"user_id\": 1,\n               \"amount\": \"50\",\n               \"credit_or_debit\": \"Debit\",\n               \"category\": \"Groceries\",\n               \"note\": \"I spent $50 on groceries.\",\n               \"timestamp\": \"2024-08-27T03:18:41Z\",\n               \"intent\": \"AddExpense\"\n           }},\n           {{\n               \"user_id\": 1,\n               \"amount\": \"20\",\n               \"credit_or_debit\": \"Debit\",\n               \"category\": \"Coffee\",\n               \"note\": \"I spent $20 on coffee.\",\n               \"timestamp\": \"2024-08-27T03:18:41Z\",\n               \"intent\": \"AddExpense\"\n           }}\n       ]\n\n    2. Input: \"I spent 50 on a pen and 20 on noodles.\"\n       - Output: [\n           {{\n               \"user_id\": 1,\n               \"amount\": \"50\",\n               \"credit_or_debit\": \"Debit\",\n               \"category\": \"Stationery\",\n               \"note\": \"I spent 50 on a pen.\",\n               \"timestamp\": \"2024-08-27T03:18:41Z\",\n               \"intent\": \"AddExpense\"\n           }},\n           {{\n               \"user_id\": 1,\n               \"amount\": \"20\",\n               \"credit_or_debit\": \"Debit\",\n               \"category\": \"Food\",\n               \"note\": \"I spent 20 on noodles.\",\n               \"timestamp\": \"2024-08-27T03:18:41Z\",\n               \"intent\": \"AddExpense\"\n           }}\n       ]\n\n    3. Input: \"Show me my expenses for this month.\"\n       - Output: {\n           \"user_id\": 1,\n           \"amount\": null,\n           \"credit_or_debit\": null,\n           \"category\": null,\n           \"note\": \"Show me my expenses for this month.\",\n           \"timestamp\": \"2024-08-27T03:18:41Z\",\n           \"intent\": \"ViewExpenses\"\n       }\n\n       The response must contain text of that format only.",
+bearer = HTTPBearer(auto_error=False)
+
+
+def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> str:
+    """Verify the Firebase ID token sent by the client and return the user's uid."""
+    if creds is None:
+        raise HTTPException(status_code=401, detail="Not signed in")
+    try:
+        return firebase_auth.verify_id_token(creds.credentials)["uid"]
+    except Exception:
+        raise HTTPException(status_code=401, detail="Your session has expired. Please log in again.")
+
+
+def user_doc(uid: str):
+    return db.collection("users").document(uid)
+
+
+# ---------------------------------------------------------------- market data
+
+PRICE_TTL_SECONDS = 300
+_price_cache: dict[str, tuple[float, float]] = {}
+
+
+def normalize_symbol(symbol: str) -> str:
+    symbol = symbol.strip().upper()
+    if not symbol or len(symbol) > 15 or not all(c.isalnum() or c in ".-^=" for c in symbol):
+        raise HTTPException(status_code=400, detail="Invalid ticker symbol")
+    return symbol
+
+
+def close_history(symbol: str, period: str) -> pd.Series:
+    try:
+        history = yf.Ticker(symbol).history(period=period)
+    except Exception:
+        log.exception("yfinance request failed for %s", symbol)
+        raise HTTPException(status_code=502, detail="Couldn't reach the market data provider")
+    closes = history["Close"].dropna() if "Close" in history else pd.Series(dtype=float)
+    if closes.empty:
+        raise HTTPException(status_code=404, detail=f"No price data found for {symbol}")
+    return closes
+
+
+def latest_price(symbol: str) -> float:
+    cached = _price_cache.get(symbol)
+    if cached and time.monotonic() - cached[1] < PRICE_TTL_SECONDS:
+        return cached[0]
+    price = float(close_history(symbol, "5d").iloc[-1])
+    _price_cache[symbol] = (price, time.monotonic())
+    return price
+
+
+@app.get("/stock/{symbol}")
+def stock_prices(symbol: str):
+    symbol = normalize_symbol(symbol)
+    closes = close_history(symbol, "1mo")
+    return {
+        "symbol": symbol,
+        "prices": [{"date": ts.date().isoformat(), "close": round(float(c), 2)} for ts, c in closes.items()],
+    }
+
+
+# ---------------------------------------------------------------- transactions
+
+class ParsedTransaction(BaseModel):
+    amount: float = Field(description="Amount of money as a positive number, without currency symbols")
+    type: Literal["debit", "credit"] = Field(description="debit for money spent, credit for money received")
+    category: str = Field(description="Short category in Title Case, e.g. Groceries, Rent, Transport, Salary")
+    note: str = Field(description="The part of the user's message that describes this transaction")
+
+
+class ParsedMessage(BaseModel):
+    intent: Literal["add_transactions", "view_expenses", "other"]
+    transactions: list[ParsedTransaction]
+
+
+CHAT_INSTRUCTIONS = """You read messages a user sends to their personal finance assistant.
+- If the message records money spent or received, set intent to "add_transactions" and list every
+  transaction it mentions, one entry per amount.
+- If the message asks to see or summarise their spending, set intent to "view_expenses" and return
+  no transactions.
+- Otherwise set intent to "other" and return no transactions.
+Never invent amounts that are not in the message."""
+
+HELP_REPLY = (
+    "I can record what you spend or earn (e.g. \"I spent $12 on lunch and got paid $2000\") "
+    "or summarise this month's spending (\"show my expenses\")."
 )
 
-chat = model.start_chat(history=[])
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+
+
+def month_start() -> datetime:
+    return datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def serialize_transaction(doc_id: str, data: dict) -> dict:
+    return {**data, "id": doc_id, "timestamp": data["timestamp"].isoformat()}
+
+
+def month_summary(uid: str) -> dict:
+    docs = (
+        user_doc(uid)
+        .collection("transactions")
+        .where(filter=FieldFilter("timestamp", ">=", month_start()))
+        .order_by("timestamp", direction=firestore.Query.DESCENDING)
+        .stream()
+    )
+    transactions = [serialize_transaction(d.id, d.to_dict()) for d in docs]
+
+    by_category: dict[str, float] = {}
+    for t in transactions:
+        if t["type"] == "debit":
+            by_category[t["category"]] = by_category.get(t["category"], 0) + t["amount"]
+
+    return {
+        "month": month_start().strftime("%Y-%m"),
+        "transactions": transactions,
+        "by_category": [
+            {"category": c, "total": round(v, 2)}
+            for c, v in sorted(by_category.items(), key=lambda kv: kv[1], reverse=True)
+        ],
+        "total_spent": round(sum(t["amount"] for t in transactions if t["type"] == "debit"), 2),
+        "total_income": round(sum(t["amount"] for t in transactions if t["type"] == "credit"), 2),
+    }
+
+
+@app.get("/transactions")
+def list_transactions(uid: str = Depends(current_user)):
+    return month_summary(uid)
+
 
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
-    user_message = request.message
-    
+def chat(request: ChatRequest, uid: str = Depends(current_user)):
     try:
-        # Send the message to the model and collect the streamed response
-        response = chat.send_message(user_message)
-        print(response.text)
-        
-        # Collect all chunks from the streamed response
-        current = ""
-        for chunk in response:
-            if chunk.text:
-                current += chunk.text
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=request.message,
+            config=types.GenerateContentConfig(
+                system_instruction=CHAT_INSTRUCTIONS,
+                response_mime_type="application/json",
+                response_schema=ParsedMessage,
+                temperature=0,
+            ),
+        )
+    except Exception:
+        log.exception("Gemini request failed")
+        raise HTTPException(status_code=502, detail="The assistant is unavailable right now. Please try again.")
 
-        # Attempt to parse the final JSON output
-        jsonstrs = json.loads(response.text)  # Modify this as needed based on the structure of `current`.
+    parsed = response.parsed
+    if not isinstance(parsed, ParsedMessage):
+        log.warning("Unparseable Gemini response: %r", response.text)
+        raise HTTPException(status_code=502, detail="The assistant couldn't understand that. Try rephrasing.")
 
-        doc_ref = db.collection('chat_logs').document()  # Auto-generate document ID
-        doc_ref.set({
-            'user_message': user_message,
-            'model_response': current,
-            'timestamp': datetime.now().isoformat()
-        })
-        datatable = db.collection('transaction_info').document()
-        for jsonstr in jsonstrs:
-            datatable.set({
-                'user_id': jsonstr['user_id'],
-                'amount': jsonstr['amount'],
-                'credit_or_debit': jsonstr['credit_or_debit'],
-                'category': jsonstr['category'],
-                'note': jsonstr['note'],
-                'timestamp': datetime.now().isoformat(),
-                'intent': jsonstr['intent']
-        })
-        return jsonstrs  # Send the parsed JSON as the API response
-    except Exception as e:
-        # In case of any errors, raise an HTTP 500 error with the exception details
-        raise HTTPException(status_code=500, detail=str(e))
+    user = user_doc(uid)
+    now = datetime.now(timezone.utc)
+    user.collection("chat_logs").add({"message": request.message, "response": response.text, "timestamp": now})
+
+    if parsed.intent == "view_expenses":
+        summary = month_summary(uid)
+        top = ", ".join(f"{c['category']} ${c['total']:.2f}" for c in summary["by_category"][:3])
+        reply = f"You've spent ${summary['total_spent']:.2f} so far this month"
+        reply += f" (top categories: {top})." if top else "."
+        return {"reply": reply, "transactions": []}
+
+    transactions = [t for t in parsed.transactions if t.amount > 0] if parsed.intent == "add_transactions" else []
+    if not transactions:
+        return {"reply": HELP_REPLY, "transactions": []}
+
+    batch = db.batch()
+    saved = []
+    for t in transactions:
+        ref = user.collection("transactions").document()
+        data = {**t.model_dump(), "timestamp": now}
+        batch.set(ref, data)
+        saved.append(serialize_transaction(ref.id, data))
+    batch.commit()
+
+    noun = "transaction" if len(saved) == 1 else "transactions"
+    return {"reply": f"Recorded {len(saved)} {noun}.", "transactions": saved}
 
 
-# Define the request model using Pydantic
-class ChatRequest(BaseModel):
-    message: str
+# ---------------------------------------------------------------- portfolio
+
+class HoldingRequest(BaseModel):
+    symbol: str
+    amount_spent: float = Field(gt=0)
+    purchase_price: float = Field(gt=0)
+
+
+def holding_view(doc_id: str, data: dict) -> dict:
+    """Value a holding at the latest market price (None if the price is unavailable)."""
+    try:
+        price = latest_price(data["symbol"])
+    except HTTPException:
+        price = None
+    shares = data["amount_spent"] / data["purchase_price"]
+    return {
+        **data,
+        "id": doc_id,
+        "shares": shares,
+        "current_price": price,
+        "current_value": shares * price if price is not None else None,
+        "gain_pct": (price - data["purchase_price"]) / data["purchase_price"] * 100 if price is not None else None,
+    }
+
+
+@app.get("/portfolio")
+def list_holdings(uid: str = Depends(current_user)):
+    docs = user_doc(uid).collection("holdings").stream()
+    return [holding_view(d.id, d.to_dict()) for d in docs]
+
+
+@app.post("/portfolio")
+def add_holding(request: HoldingRequest, uid: str = Depends(current_user)):
+    symbol = normalize_symbol(request.symbol)
+    latest_price(symbol)  # rejects unknown tickers before saving
+    data = {"symbol": symbol, "amount_spent": request.amount_spent, "purchase_price": request.purchase_price}
+    _, ref = user_doc(uid).collection("holdings").add(data)
+    return holding_view(ref.id, data)
+
+
+@app.delete("/portfolio/{holding_id}", status_code=204)
+def delete_holding(holding_id: str, uid: str = Depends(current_user)):
+    ref = user_doc(uid).collection("holdings").document(holding_id)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Holding not found")
+    ref.delete()
+
+
+# ---------------------------------------------------------------- news sentiment
+
+SENTIMENT_MODEL = "ProsusAI/finbert"
+SENTIMENT_TTL = timedelta(hours=6)
+sentiment_tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL)
+sentiment_model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL).eval()
+
 
 class SentimentRequest(BaseModel):
     stock_symbol: str
 
-def predict_sentiment(text):
-    # Tokenize and encode the text
-    inputs = sentiment_tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
 
-    # Make prediction
-    with torch.no_grad():
-        outputs = sentiment_model(**inputs)
-        logits = outputs.logits
-        predicted_class = torch.argmax(logits, dim=1).item()
-
-    # Map prediction to sentiment (assumed 5 classes for sentiment)
-    return 'positive' if predicted_class > 2 else 'negative'
-
-def get_news_headlines(stock_symbol):
+def recent_headlines(symbol: str, limit: int = 15) -> list[str]:
+    today = date.today()
     try:
-        to_date = datetime.today().strftime('%Y-%m-%d')
-        from_date = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
-        new_response = finnhub_client.company_news(stock_symbol, _from=from_date, to=to_date)
-        headlines = [article['headline'] for article in new_response[-15:]]
-    except:
-        print("error")
+        articles = finnhub_client.company_news(symbol, _from=(today - timedelta(days=30)).isoformat(), to=today.isoformat())
+    except Exception:
+        log.exception("Finnhub request failed for %s", symbol)
+        raise HTTPException(status_code=502, detail=f"Couldn't fetch news for {symbol}")
 
-    # try:
-    #     response = requests.get(url)
-    #     response.raise_for_status()  # This will raise an exception for HTTP errors
-    #     data = response.json()
-    #     return [article['title'] for article in data['data']]
-    # except requests.exceptions.HTTPError as e:
-    #     print(f"HTTP error occurred: {e}")
-    #     if response.status_code == 401:
-    #         print("This may be due to an invalid API key or authentication issue.")
-    # except requests.exceptions.RequestException as e:
-    #     print(f"An error occurred while making the request: {e}")
-    # except KeyError as e:
-    #     print(f"Unexpected data format: {e}")
-    #     print(f"Response content: {response.text}")
-    
+    headlines: list[str] = []
+    for article in sorted(articles, key=lambda a: a.get("datetime", 0), reverse=True):
+        headline = (article.get("headline") or "").strip()
+        if headline and headline not in headlines:
+            headlines.append(headline)
+        if len(headlines) == limit:
+            break
     return headlines
-@app.get("/stock/{symbol}")
-def get_stock_data(symbol: str):
-    stock = yf.Ticker(symbol)
-    history = stock.history(period="1mo")  # Fetch stock price data for the last month
-    return history["Close"].to_dict() 
+
+
+def classify_headlines(headlines: list[str]) -> list[str]:
+    inputs = sentiment_tokenizer(headlines, return_tensors="pt", truncation=True, padding=True, max_length=64)
+    with torch.no_grad():
+        logits = sentiment_model(**inputs).logits
+    return [sentiment_model.config.id2label[i].lower() for i in logits.argmax(dim=1).tolist()]
+
 
 @app.post("/analyze-sentiment")
-async def analyze_sentiment(request: SentimentRequest):
-    stock_symbol = request.stock_symbol
-    headlines = get_news_headlines(stock_symbol)
-    sentiments = []
+def analyze_sentiment(request: SentimentRequest):
+    symbol = normalize_symbol(request.stock_symbol)
+    cache_ref = db.collection("sentiment_analysis").document(symbol)
 
-    for headline in headlines:
-        sentiment = predict_sentiment(headline)
-        sentiments.append(sentiment)
-    
-    positive_count = sentiments.count('positive')
-    negative_count = sentiments.count('negative')
-    average_sentiment = 'Positive' if positive_count > negative_count else 'Negative'
+    cached = cache_ref.get().to_dict()
+    if cached and cached.get("model") == SENTIMENT_MODEL and datetime.now(timezone.utc) - cached["timestamp"] < SENTIMENT_TTL:
+        return {**cached, "timestamp": cached["timestamp"].isoformat()}
 
-    # Prepare the result to save to Firestore
-    analysis_result = {
-        'stock_symbol': stock_symbol,
-        'positive_headlines': positive_count,
-        'negative_headlines': negative_count,
-        'average_sentiment': average_sentiment,
-        'timestamp': datetime.now().isoformat()
+    headlines = recent_headlines(symbol)
+    labels = classify_headlines(headlines) if headlines else []
+    counts = {label: labels.count(label) for label in ("positive", "neutral", "negative")}
+    if not headlines:
+        overall = None
+    elif counts["positive"] > counts["negative"]:
+        overall = "positive"
+    elif counts["negative"] > counts["positive"]:
+        overall = "negative"
+    else:
+        overall = "neutral"
+
+    result = {
+        "symbol": symbol,
+        "overall": overall,
+        "counts": counts,
+        "headlines": [{"headline": h, "sentiment": s} for h, s in zip(headlines, labels)],
+        "model": SENTIMENT_MODEL,
+        "timestamp": datetime.now(timezone.utc),
     }
-
-    # Save the analysis result to Firestore
-    db.collection('sentiment_analysis').document(stock_symbol).set(analysis_result)
-
-    return analysis_result  # Return the summary of sentiment analysis
+    cache_ref.set(result)
+    return {**result, "timestamp": result["timestamp"].isoformat()}
 
 
-# Define the LSTM Model
+# ---------------------------------------------------------------- price prediction
+
+SEQUENCE_LENGTH = 10  # window length the LSTM was trained on
+FORECAST_DAYS = 7
+
+
 class LSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
-        super(LSTM, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
+        super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device).requires_grad_()
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device).requires_grad_()
-        out, (hn, cn) = self.lstm(x, (h0.detach(), c0.detach()))
-        out = self.fc(out[:, -1, :])
-        return out
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
 
-# Function to load the model
-def load_model(model, filepath, device):
-    model.load_state_dict(torch.load(filepath, map_location=device))
-    model.eval()
-    print(f"Model loaded from {filepath}")
-    return model
 
-# Set device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+lstm = LSTM(input_dim=1, hidden_dim=32, num_layers=2, output_dim=1).to(device)
+lstm.load_state_dict(torch.load("model.pth", map_location=device, weights_only=True))
+lstm.eval()
 
-# Initialize model and load the weights
-input_dim = 1
-hidden_dim = 32
-num_layers = 2
-output_dim = 1
-model = LSTM(input_dim, hidden_dim, num_layers, output_dim).to(device)
-model = load_model(model, 'model.pth', device)
 
-# Scaler (same as used during training)
-scaler = MinMaxScaler(feature_range=(-1, 1))
-
-# Function to get the latest stock data
-def get_stock_data(ticker, seq_length):
-    stock_data = yf.download(ticker, period='1y')  # Adjust this as necessary
-    closing_prices = stock_data['Close'].values.reshape(-1, 1)
-    scaled_data = scaler.fit_transform(closing_prices)
-    last_sequence = scaled_data[-seq_length:]
-    return torch.FloatTensor(last_sequence).unsqueeze(0).to(device)
-
-# Define the request model (Pydantic BaseModel)
 class StockRequest(BaseModel):
     ticker: str
 
-# /predict API endpoint
+
 @app.post("/predict")
-async def predict(request: StockRequest):
-    ticker = request.ticker
+def predict(request: StockRequest):
+    symbol = normalize_symbol(request.ticker)
+    closes = close_history(symbol, "1y")
+    if len(closes) < SEQUENCE_LENGTH:
+        raise HTTPException(status_code=404, detail=f"Not enough price history for {symbol}")
 
-    # Sequence length should match what you trained on (10 in your case)
-    sequence_length = 10
-    try:
-        # Fetch the last sequence of stock data
-        last_sequence = get_stock_data(ticker, sequence_length)
-        
-        # Predict the next 7 days
-        predicted = []
-        for _ in range(7):
-            with torch.no_grad():
-                pred = model(last_sequence)
-                predicted.append(pred.item())
-                # Update the last_sequence with the predicted value
-                last_sequence = torch.cat((last_sequence[:, 1:, :], pred.reshape(1, 1, 1)), dim=1)
+    # The scaler from training wasn't saved, so fit one on the past year of this ticker's prices.
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaled = scaler.fit_transform(closes.to_numpy().reshape(-1, 1))
+    window = torch.tensor(scaled[-SEQUENCE_LENGTH:], dtype=torch.float32, device=device).unsqueeze(0)
 
-        # Inverse transform predictions
-        predicted = scaler.inverse_transform(np.array(predicted).reshape(-1, 1))
-        predictions = predicted.flatten().tolist()
+    # Roll forward one trading day at a time, feeding each prediction back into the window.
+    predicted = []
+    with torch.no_grad():
+        for _ in range(FORECAST_DAYS):
+            step = lstm(window)
+            predicted.append(step.item())
+            window = torch.cat((window[:, 1:, :], step.view(1, 1, 1)), dim=1)
 
-        return {"ticker": ticker, "predictions": predictions}
+    prices = scaler.inverse_transform(np.array(predicted).reshape(-1, 1)).ravel()
+    last_date = closes.index[-1].date()
+    dates = pd.bdate_range(last_date + timedelta(days=1), periods=FORECAST_DAYS)
+    return {
+        "ticker": symbol,
+        "last_close": round(float(closes.iloc[-1]), 2),
+        "last_close_date": last_date.isoformat(),
+        "predictions": [{"date": d.date().isoformat(), "price": round(float(p), 2)} for d, p in zip(dates, prices)],
+    }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
